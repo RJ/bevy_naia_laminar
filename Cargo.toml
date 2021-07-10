@@ -1,0 +1,51 @@
+[package]
+name = "bevy_naia_laminar"
+version = "0.1.0"
+edition = "2018"
+authors = ["Richard Jones <rj@metabrew.com>"]
+description = "Networking plugin for Bevy, running Laminar atop naia-socket for native + wasm for UDP gamedev"
+readme = "README.md"
+license = "MIT"
+homepage = "https://github.com/RJ/bevy_naia_laminar"
+repository = "https://github.com/RJ/bevy_naia_laminar"
+keywords = ["bevy", "gamedev", "netcode", "networking", "udp", "webrtc", "wasm"]
+categories = [
+    "game-development",
+    "network-programming",
+    "wasm",
+    "web-programming",
+]
+exclude = [".git*"]
+
+[features]
+default = ["use-udp"]
+use-udp = ["naia-server-socket/use-udp"]
+use-webrtc = [
+    "naia-server-socket/use-webrtc",
+    "naia-client-socket/wbindgen",
+]
+
+[dependencies]
+bevy = {version = "0.5", default-features = false}
+naia-client-socket = { version = "0.6.1", features = ["multithread"] }
+futures-lite = "1.11"
+crossbeam-channel = "0.5"
+instant = "0.1"
+laminar = "0.5.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+naia-server-socket = "0.5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+log = "0.4.14"
+
+[dev-dependencies]
+cfg-if = "1.0"
+# rand = { version = "0.7.3", features = ["wasm-bindgen"] }
+console_error_panic_hook = "0.1"
+console_log = "0.2"
+wasm-bindgen = "=0.2.69" # pin to bevy 0.5's dependency version
+
+[patch.crates-io]
+laminar = {git = "https://github.com/RJ/laminar.git", branch = "wasm"}
+#laminar = {path = "../laminar"}
