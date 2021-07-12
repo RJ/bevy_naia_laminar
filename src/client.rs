@@ -26,12 +26,17 @@ pub use laminar::{
     SocketEvent as LaminarSocketEvent,
 };
 
+// use laminar::{DeliveryGuarantee, OrderingGuarantee};
+
 pub mod prelude {
     pub use super::{LaminarConfig, LaminarPacket, LaminarSocketEvent};
     pub use naia_client_socket::LinkConditionerConfig;
     pub use super::NetworkResource;
     pub use super::ClientNetworkingPlugin;
+    pub use laminar::{DeliveryGuarantee, OrderingGuarantee};
 }
+
+use crate::prelude::*;
 
 // If we want to allow connections to multiple laminar servers, we'll have to expose PeerConnections.
 // for now we just support connecting to 1 server, and expose everything through NetworkResource functions
@@ -42,6 +47,8 @@ struct PeerConnection {
     laminar_vconnection: LaminarVirtualConnection,
     laminar_messenger: LaminarConnectionMessengerForNaia,
     laminar_event_receiver: Receiver<ReceiveEvent>,
+    connection_state: ConnectionState,
+    // housekeeping: Housekeeping,
 }
 
 impl PeerConnection {
@@ -67,17 +74,47 @@ impl PeerConnection {
             Instant::now(),
         );
         
-        PeerConnection {
+        let mut pc = PeerConnection {
             naia_socket,
             server_addr: *server_socket_address,
             laminar_vconnection,
             laminar_messenger,
             laminar_event_receiver,
-        }
+            connection_state: ConnectionState::Connecting,
+            // housekeeping: Housekeeping::default(),
+        };
+        // send an empty packet, which the server will respond to, to setup the connection
+        pc.send(pc.reliable_unordered_packet(vec![]));
+        pc
+    }
+
+    // wrap the laminar packet constructors, but provide our server addr automatically as the dst
+    pub fn unreliable_packet(&self, payload: Vec<u8>) -> LaminarPacket {
+        LaminarPacket::unreliable(*self.server_addr(), payload)
+    }
+    pub fn unreliable_sequenced_packet(&self, payload: Vec<u8>, stream_id: Option<u8>) -> LaminarPacket {
+        LaminarPacket::unreliable_sequenced(*self.server_addr(), payload, stream_id)
+    }
+    pub fn reliable_unordered_packet(&self, payload: Vec<u8>) -> LaminarPacket {
+        LaminarPacket::reliable_unordered(*self.server_addr(), payload)
+    }
+    pub fn reliable_ordered_packet(&self, payload: Vec<u8>, stream_id: Option<u8>) -> LaminarPacket {
+        LaminarPacket::reliable_ordered(*self.server_addr(), payload, stream_id)
+    }
+    pub fn reliable_sequenced_packet(&self, payload: Vec<u8>, stream_id: Option<u8>) -> LaminarPacket {
+        LaminarPacket::reliable_sequenced(*self.server_addr(), payload, stream_id)
+    }
+
+    pub fn state(&self) -> ConnectionState {
+        self.connection_state
+    }
+
+    fn set_state(&mut self, new_state: ConnectionState) {
+        self.connection_state = new_state;
     }
 
     /// gets laminar event receiver
-    pub fn event_receiver(&mut self) -> &Receiver<ReceiveEvent> {
+    pub fn event_receiver(&self) -> &Receiver<ReceiveEvent> {
         &self.laminar_event_receiver
     }
 
@@ -97,8 +134,7 @@ impl PeerConnection {
             match self.naia_socket.receive() {
                 Ok(event) => match event {
                     Some(packet) => {
-                        log::info!("process_incoming: {:?}", String::from_utf8_lossy(packet.payload()));
-                        // Bytes::copy_from_slice(packet.payload())
+                        // log::info!("process_incoming: {:?}", String::from_utf8_lossy(packet.payload()));
                         self.laminar_vconnection.process_packet(&mut self.laminar_messenger, packet.payload(), time);
                     },
                     None => {
@@ -135,7 +171,7 @@ impl Plugin for ClientNetworkingPlugin {
             self.link_conditioner.clone(),
         );
         app
-        .add_event::<LaminarSocketEvent>()
+        .add_event::<PeerEvent>()
         .insert_resource(net_resource)
         .add_system(laminar_poller.system())
         ;
@@ -157,13 +193,13 @@ impl LaminarConnectionMessenger<ReceiveEvent> for LaminarConnectionMessengerForN
 
     // publishes laminar connection event
     fn send_event(&mut self, _address: &SocketAddr, event: ReceiveEvent) {
-        log::info!("PacketMessenger::send_event {:?}", event);
+        // log::info!("PacketMessenger::send_event {:?}", event);
         self.laminar_event_sender.send(event).expect("send_event failed?");
     }
 
     // sends packet
     fn send_packet(&mut self, _address: &SocketAddr, payload: &[u8]) {
-        log::info!("PacketMessenger::send_packet {}", payload.len());
+        // log::info!("PacketMessenger::send_packet {}", payload.len());
         self.naia_message_sender
             .send(NaiaPacket::new(payload.to_vec()))
             .expect("send packet error");
@@ -200,10 +236,18 @@ impl NetworkResource {
         self.connection.is_some()
     }
 
+    pub fn connection_state(&self) -> ConnectionState {
+        if self.initialized() {
+            self.connection().state()
+        } else {
+            ConnectionState::Uninitialized
+        }
+    }
+
     /// Get Laminar event receiver
-    fn event_receiver(&mut self) -> &Receiver<ReceiveEvent> {
+    fn event_receiver(&self) -> &Receiver<ReceiveEvent> {
         assert!(self.initialized(), "not initialized!");
-        self.connection_mut().event_receiver()
+        self.connection().event_receiver()
     }
 
     /// Get SocketAddr of server we are connected to
@@ -264,7 +308,7 @@ impl NetworkResource {
 
 fn laminar_poller(
     mut net: ResMut<NetworkResource>,
-    mut lam_evs: EventWriter<LaminarSocketEvent>,
+    mut peer_events: EventWriter<PeerEvent>,
 ){
     if !net.initialized() {
         return;
@@ -272,10 +316,29 @@ fn laminar_poller(
 
     net.poll();
 
-    let event_receiver = net.event_receiver();
+    let event_receiver = net.event_receiver().clone();
+
+    let conn = net.connection_mut();
 
     // publish laminar socket events to bevy events - we won't expose the event_receiver.
     while let Ok(event) = event_receiver.try_recv() {
-        lam_evs.send(event);
+        match event {
+            LaminarSocketEvent::Connect(addr) => {
+                conn.set_state(ConnectionState::Connected);
+                peer_events.send(PeerEvent::Status(addr, conn.state()));
+            },
+            LaminarSocketEvent::Disconnect(addr) => {
+                conn.set_state(ConnectionState::Disconnected);
+                peer_events.send(PeerEvent::Status(addr, conn.state()));
+            },
+            LaminarSocketEvent::Timeout(addr) => {
+                conn.set_state(ConnectionState::Timeout);
+                peer_events.send(PeerEvent::Status(addr, conn.state()));
+            },
+            LaminarSocketEvent::Packet(packet) => {
+                assert_eq!(conn.state(), ConnectionState::Connected);
+                peer_events.send(PeerEvent::Packet(packet));
+            },
+        }
     }
 }

@@ -13,11 +13,13 @@ use crossbeam_channel::{
     RecvError as CrossbeamRecvError,
     SendError as CrossbeamSendError,
 };
+use laminar::{Connection, Socket};
 
 use std::{
     fmt::Debug,
     net::SocketAddr,
-    io
+    io,
+    collections::HashMap,
 };
 
 use instant::Instant;
@@ -41,6 +43,8 @@ pub use laminar::{
     SocketEvent as LaminarSocketEvent,
     VirtualConnection as LaminarVirtualConnection,
 };
+
+use crate::prelude::*;
 
 pub mod prelude {
     pub use super::{LaminarConfig, LaminarPacket, LaminarSocketEvent};
@@ -100,6 +104,7 @@ impl LaminarDatagramSocket for LaminarDatagramSocketForNaia {
     }
 }
 
+
 #[derive(Default)]
 pub struct ServerNetworkingPlugin {
     pub link_conditioner: Option<LinkConditionerConfig>,
@@ -119,9 +124,50 @@ impl Plugin for ServerNetworkingPlugin {
             task_pool,
             self.link_conditioner.clone(),
         ))
-        .add_event::<LaminarSocketEvent>()
+        .add_event::<LaminarPacket>()
+        .add_event::<PeerEvent>()
         .add_system(laminar_poller.system())
         ;
+    }
+}
+
+
+
+// peers, keyed by their socketaddr
+#[derive(Debug)]
+pub struct Peer {
+    pub epoch: Instant,
+    pub socket_addr: SocketAddr,
+    connection_state: ConnectionState,
+    event_sender: Sender<LaminarPacket>,
+}
+
+impl Peer {
+    fn new(socket_addr: SocketAddr, event_sender: Sender<LaminarPacket>) -> Self {
+        Self {
+            epoch: Instant::now(),
+            socket_addr,
+            connection_state: ConnectionState::Connecting,
+            event_sender,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+
+    pub fn send(&self, packet: LaminarPacket) -> Result<(), CrossbeamSendError<LaminarPacket>> {
+        self.event_sender.send(packet)
+    }
+
+    pub fn state(&self) -> ConnectionState {
+        self.connection_state
+    }
+    
+    fn set_state(&mut self, new_state: ConnectionState) -> bool {
+        let changed = new_state != self.connection_state;
+        self.connection_state = new_state;
+        changed
     }
 }
 
@@ -130,6 +176,7 @@ pub struct NetworkResource {
     listeners: Vec<ServerListener>,
     manager: Option<LaminarConnectionManager<LaminarDatagramSocketForNaia, LaminarVirtualConnection>>,
     link_conditioner: Option<LinkConditionerConfig>,
+    peers: HashMap<SocketAddr, Peer>,
 }
 
 // just used to keep tasks in scope so they aren't dropped
@@ -149,8 +196,33 @@ impl NetworkResource {
             link_conditioner,
             listeners: Vec::new(),
             manager: None,
+            peers: HashMap::new(),
         }
     }
+
+    fn new_peer(&self, addr: SocketAddr) -> Peer {
+        Peer::new(addr, self.event_sender().clone())
+    }
+
+    pub fn peer(&self, handle: PeerHandle) -> Option<&Peer> {
+        self.peers.get(&handle)
+    }
+
+    pub fn peer_mut(&mut self, handle: PeerHandle) -> Option<&mut Peer> {
+        self.peers.get_mut(&handle)
+    }
+
+    pub fn num_peers(&self) -> usize {
+        self.peers.len()
+    }
+
+    // fn peers_mut(&mut self) -> &mut HashMap<SocketAddr, Peer> {
+    //     &mut self.peers
+    // }
+
+    // pub fn peers(&self) -> &HashMap<SocketAddr, Peer> {
+    //     &self.peers
+    // }
 
     /// everything is going to crash with an assert unless this returns true
     pub fn initialized(&self) -> bool {
@@ -172,14 +244,18 @@ impl NetworkResource {
         self.manager_mut().manual_poll(Instant::now());
     }
 
-    pub fn send(&mut self, packet: LaminarPacket) -> Result<(), CrossbeamSendError<LaminarPacket>> {
-        assert!(self.initialized(), "manager not initialised yet");
-        self.manager().event_sender().send(packet)
+    pub fn send(&self, packet: LaminarPacket) -> Result<(), CrossbeamSendError<LaminarPacket>> {
+        self.event_sender().send(packet)
     }
 
-    pub fn event_receiver(&mut self) -> &Receiver<LaminarSocketEvent> {
+    pub fn event_sender(&self) -> &Sender<LaminarPacket> {
         assert!(self.initialized(), "manager not initialised yet");
-        self.manager_mut().event_receiver()
+        self.manager().event_sender()
+    }
+
+    pub fn event_receiver(&self) -> &Receiver<LaminarSocketEvent> {
+        assert!(self.initialized(), "manager not initialised yet");
+        self.manager().event_receiver()
     }
 
     /// The 3 listening addresses aren't strictly necessary, you can put the same IP address with
@@ -274,7 +350,7 @@ impl NetworkResource {
 
 fn laminar_poller(
     mut net: ResMut<NetworkResource>,
-    mut lam_evs: EventWriter<LaminarSocketEvent>,
+    mut peer_events: EventWriter<PeerEvent>,
 ){
     if !net.initialized() {
         return;
@@ -282,10 +358,74 @@ fn laminar_poller(
 
     net.poll();
 
-    let event_receiver = net.event_receiver();
+    let event_receiver = net.event_receiver().clone();
 
-    // publish laminar socket events to bevy events - we won't expose the event_receiver.
+    // publish to bevy events - we won't expose the event_receiver
+    // also adding in a bit of connection tracking.
     while let Ok(event) = event_receiver.try_recv() {
-        lam_evs.send(event);
+        match event {
+            LaminarSocketEvent::Connect(addr) => {
+                if let Some(existing_peer) = net.peers.get_mut(&addr) {
+                    assert_eq!(existing_peer.state(), ConnectionState::Connecting);
+                    // log::warn!("Connect event for existing peer on {}, in state: {:?} (setting to connected)", addr, existing_peer.state());
+                    let new_state = ConnectionState::Connected;
+                    if existing_peer.set_state(new_state) {
+                        peer_events.send(PeerEvent::Status(addr, new_state));
+                    }
+                } else {
+                    log::warn!("Laminar connect event but no known peer {}", addr);
+                }
+            },
+            LaminarSocketEvent::Disconnect(addr) => {
+                if let Some(mut existing_peer) = net.peers.remove(&addr) {
+                    let state = ConnectionState::Disconnected;
+                    if existing_peer.set_state(state) {
+                        peer_events.send(PeerEvent::Status(addr, existing_peer.state()));
+                    }
+                } else {
+                    log::warn!("Got laminar disconnected event for unknown peer {}", addr);
+                }
+            },
+            LaminarSocketEvent::Timeout(addr) => {
+                // laminar will send disconnect right after timeout, so no removal here
+                if let Some(existing_peer) = net.peers.get_mut(&addr) {
+                    let state = ConnectionState::Timeout;
+                    if existing_peer.set_state(state) {
+                        peer_events.send(PeerEvent::Status(addr, existing_peer.state()));
+                    }
+                } else {
+                    log::warn!("Got laminar timeout event for unknown peer {}", addr);
+                }
+            },
+            LaminarSocketEvent::Packet(packet) => {
+                // log::info!(">>packet, str: '{}'", String::from_utf8_lossy(packet.payload()));
+                // NB: peer_handle() is added by our trait, just returns the socket addr
+                if let Some(existing_peer) = net.peers.get_mut(&packet.peer_handle()) {
+                    // if we are getting a packet from a peer still in Connecting state, we need to send them a packet
+                    // in order to put the connection into a connected state.
+                    if existing_peer.state() == ConnectionState::Connecting && packet.payload().len() == 0 {
+                        // still sending empty welcome/handshake packets
+                        continue;
+                    }
+                    assert_eq!(existing_peer.state(), ConnectionState::Connected);
+                    peer_events.send(PeerEvent::Packet(packet));
+                } else {
+                    // got a packet from an unknown peer, must be a new connection.
+                    let pc = net.new_peer(packet.addr());
+                    let initial_state = pc.state();
+                    net.peers.insert(packet.addr(), pc);
+                    // send a welcome packet.
+                    let welcome_packet = LaminarPacket::reliable_unordered(packet.addr(), vec![]);
+                    log::info!("New peer detected! Welcoming {}", packet.addr());
+                    net.send(welcome_packet).unwrap_or_default();
+                    peer_events.send(PeerEvent::Status(packet.peer_handle(), initial_state));
+                    // welcome packets are 0 len
+                    assert_eq!(packet.payload().len(), 0);
+                    // dont publish welcome packets
+                    // packet_events.send(packet);
+                }
+                
+            },
+        }
    }
 }
